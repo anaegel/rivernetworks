@@ -34,7 +34,7 @@ print("    dt 			= " .. ARGS.dt)
 print("    grid         = " .. gridName)
 
 -- choose algebra
-InitUG(ARGS.dim, AlgebraType("CPU", 1));
+InitUG(ARGS.dim, AlgebraType("CPU", 2));
 
 -- Create, Load, Refine and Distribute Domain
 local mandatorySubsets = {"River", "Sink"}
@@ -52,7 +52,8 @@ print(dom:domain_info():to_string())
 -- create Approximation Space
 print(">> Create ApproximationSpace")
 local approxSpace = ApproximationSpace(dom)
-approxSpace:add_fct("c", "Lagrange", 1)
+approxSpace:add_fct("A", "Lagrange", 1)
+approxSpace:add_fct("v", "Lagrange", 1)
 
 -- lets order indices using Cuthill-McKee
 OrderCuthillMcKee(approxSpace, true);
@@ -63,18 +64,96 @@ OrderCuthillMcKee(approxSpace, true);
 
 print (">> Setting up Assembling")
 
-local elemDisc = ConvectionDiffusionFV1("c", "River")
-elemDisc:set_diffusion(ARGS.eps) -- Diffusion
--- elemDisc:set_upwind(FullUpwind())
--- elemDisc:set_velocity("Velocity")
+function U(x,y,t)
+  return 0.0
+end
+
+local elemDisc = {}
+elemDisc["A"] = ConvectionDiffusionFV1("A", "River")
+elemDisc["v"] = ConvectionDiffusionFV1("v", "River")
+
+local constOne = ConstUserVector(1.0)
+
+-- Gleichung für A
+elemDisc["A"]:set_mass_scale(1.0)                   -- \partial A / \partial t
+elemDisc["A"]:set_velocity(elemDisc["v"]:value() * constOne)   -- \partial_x (v*A)
+elemDisc["A"]:set_upwind(FullUpwind())
+
+--
+local lambda = 0.03
+local dhyd = 1.0
+
+function sign(number)
+    return number > 0 and 1 or (number == 0 and 0 or -1)
+end
+
+
+
+local B  = 1.0 -- Breite
+local zB = 0.0 -- Sohlhoehe
+
+
+-- Hoehe
+function Height(A) -- Rechteck
+    return A/B
+end
+
+function Height_dA(A) -- Rechteck
+    return 1.0/B
+end
+
+local height = LuaUserFunctionNumber("Height", 1)
+height:set_input(0, elemDisc["A"]:value())
+height:set_deriv(0, "Height_dA")
+
+
+-- Rauheit
+function Roughness(v)
+  return lambda/dhyd*0.5*math.abs(v) 
+end
+
+function Roughness_dv(v)
+  return lambda/dhyd*0.5*sign(v)
+end
+
+local roughness = LuaUserFunctionNumber("Roughness", 1)
+roughness:set_input(0, elemDisc["v"]:value())
+roughness:set_deriv(0, "Roughness_dv")
+
+
+
+
+local nu_t = 1.0
+local g = 9.81
+
+-- g*(h+zB)
+local gefaelle = ScaleAddLinkerVector()
+gefaelle:add(g*height, constOne)
+gefaelle:add(g*zB, constOne)
+
+-- Fehlt: h, zB
+elemDisc["v"]:set_upwind(FullUpwind())
+elemDisc["v"]:set_mass_scale(1.0) 
+elemDisc["v"]:set_diffusion(nu_t)                          -- \partial_x (-nu_t \partial_x v)
+elemDisc["v"]:set_velocity(0.5*elemDisc["v"]:value()*constOne)      -- \partial_x (0.5*v*v)
+elemDisc["v"]:set_flux(gefaelle)                           -- \partial_x (g *(h+zB)) 
+elemDisc["v"]:set_reaction_rate(roughness)
+
+
 
 local dirichletBND = DirichletBoundary()
-dirichletBND:add(1.0, "c", "Source1")
-dirichletBND:add(2.0, "c", "Source2")
-dirichletBND:add(0.0, "c", "Sink")
+dirichletBND:add(10.0, "A", "Source1")
+dirichletBND:add(10.0, "A", "Source2")
+dirichletBND:add(20.0, "A", "Sink")
+
+dirichletBND:add(1.0, "v", "Source1")
+dirichletBND:add(1.0, "v", "Source2")
+dirichletBND:add(2.0, "v", "Sink")
+
 
 local domainDisc = DomainDiscretization(approxSpace)
-domainDisc:add(elemDisc)
+domainDisc:add(elemDisc["A"])
+domainDisc:add(elemDisc["v"])
 domainDisc:add(dirichletBND)
 
 --------------------------------------------------------------------------------
@@ -84,9 +163,13 @@ print (">> Setting up Algebra Solver")
 
 -- if the non-linear problem shall should be solved, one has to wrap the solver
 -- inside a newton-solver. See 'solver_util.lua' for more details.
-solverDesc = {
-	type = "linear",
-	precond = {
+solverDesc = 
+{
+  type = "newton",
+  linSolver = {
+	 type = "linear",
+	 
+	 precond = {
 		type 		= "gmg",	-- preconditioner ["gmg", "ilu", "ilut", "jac", "gs", "sgs"]
 		approxSpace = approxSpace,
 		smoother 	= {
@@ -98,6 +181,7 @@ solverDesc = {
 		postSmooth 	= 2,		-- number postsmoothing steps
 		baseSolver 	= "lu"
 	},
+	
 	convCheck = {
 		type		= "standard",
 		iterations	= 100,
@@ -106,8 +190,13 @@ solverDesc = {
 		verbose=true
 	}
 }
+}
 
-solver = util.solver.CreateSolver(solverDesc)
+local dbgWriter = GridFunctionDebugWriter(approxSpace)
+dbgWriter:set_vtk_output(false)
+
+local solver = util.solver.CreateSolver(solverDesc)
+solver:set_debug(dbgWriter)
 
 --------------------------------------------------------------------------------
 --  Apply Solver
@@ -116,14 +205,15 @@ solver = util.solver.CreateSolver(solverDesc)
 -- set initial value
 print(">> Interpolation start values")
 local u = GridFunction(approxSpace)
-Interpolate(0.0, u, "c", ARGS.startTime)
+Interpolate(1.0,  u, "v", ARGS.startTime)
+Interpolate(10.0, u, "A", ARGS.startTime)
 
 -- perform time loop
---util.SolveNonlinearTimeProblem(u, domainDisc, solver, VTKOutput(), "Sol",
---							   "ImplEuler", 1, startTime, endTime, dt); 
+util.SolveNonlinearTimeProblem(u, domainDisc, solver, VTKOutput(), "Sol",
+							   "ImplEuler", 1, ARGS.startTime, ARGS.endTime, ARGS.dt); 
 
-util.SolveLinearTimeProblem(u, domainDisc, solver, VTKOutput(), "Sol",
-							"ImplEuler", 1, ARGS.startTime, ARGS.endTime, ARGS.dt); 
+--util.SolveLinearTimeProblem(u, domainDisc, solver, VTKOutput(), "Sol",
+--							"ImplEuler", 1, ARGS.startTime, ARGS.endTime, ARGS.dt); 
 
 print("Writing profile data")
 WriteProfileData("profile_data.pdxml")
