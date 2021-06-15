@@ -17,9 +17,9 @@ ARGS.eps = 1.0 -- diffusion constant
 
 ARGS.dim = util.GetParamNumber("-dim", 2, "dimension")
 ARGS.numPreRefs = util.GetParamNumber("-numPreRefs", 0, "number of refinements before parallel distribution")
-ARGS.numRefs    = util.GetParamNumber("-numRefs",    5, "number of refinements")
+ARGS.numRefs    = util.GetParamNumber("-numRefs",    2, "number of refinements")
 ARGS.startTime  = util.GetParamNumber("-start", 0.0, "start time")
-ARGS.endTime    = util.GetParamNumber("-end", charLength*charLength/ARGS.eps, "end time")
+ARGS.endTime    = util.GetParamNumber("-end", 0.1*charLength*charLength/ARGS.eps, "end time")
 ARGS.dt 		   = util.GetParamNumber("-dt", ARGS.endTime*0.05, "time step size")
 
 util.CheckAndPrintHelp("Time-dependent problem setup example");
@@ -56,7 +56,7 @@ approxSpace:add_fct("A", "Lagrange", 1)
 approxSpace:add_fct("v", "Lagrange", 1)
 
 -- lets order indices using Cuthill-McKee
-OrderCuthillMcKee(approxSpace, true);
+OrderLex(approxSpace, "x");
 
 --------------------------------------------------------------------------------
 --  Setup FV Convection-Diffusion Element Discretization
@@ -68,16 +68,18 @@ function U(x,y,t)
   return 0.0
 end
 
+local upwind = FullUpwind()
 local elemDisc = {}
 elemDisc["A"] = ConvectionDiffusionFV1("A", "River")
 elemDisc["v"] = ConvectionDiffusionFV1("v", "River")
 
-local constOne = ConstUserVector(1.0)
+
+local downStreamVec = EdgeOrientation(dom)
 
 -- Gleichung für A
+elemDisc["A"]:set_upwind(upwind)
 elemDisc["A"]:set_mass_scale(1.0)                   -- \partial A / \partial t
-elemDisc["A"]:set_velocity(elemDisc["v"]:value() * constOne)   -- \partial_x (v*A)
-elemDisc["A"]:set_upwind(FullUpwind())
+elemDisc["A"]:set_velocity(elemDisc["v"]:value() * downStreamVec)   -- \partial_x (v*A)
 
 --
 local lambda = 0.03
@@ -89,18 +91,10 @@ end
 
 
 
+-- Hoehe (Rechteck)
 local B  = 1.0 -- Breite
-local zB = 0.0 -- Sohlhoehe
-
-
--- Hoehe
-function Height(A) -- Rechteck
-    return A/B
-end
-
-function Height_dA(A) -- Rechteck
-    return 1.0/B
-end
+function Height(A) return A/B end
+function Height_dA(A) return 1.0/B end
 
 local height = LuaUserFunctionNumber("Height", 1)
 height:set_input(0, elemDisc["A"]:value())
@@ -108,11 +102,11 @@ height:set_deriv(0, "Height_dA")
 
 
 -- Rauheit
-function Roughness(v)
+function Roughness(v) 
   return lambda/dhyd*0.5*math.abs(v) 
 end
 
-function Roughness_dv(v)
+function Roughness_dv(v)  
   return lambda/dhyd*0.5*sign(v)
 end
 
@@ -126,16 +120,19 @@ roughness:set_deriv(0, "Roughness_dv")
 local nu_t = 1.0
 local g = 9.81
 
+function Sohle2d(x, y, t) return -x end
+local sohle=LuaUserNumber2d("Sohle2d")
+
 -- g*(h+zB)
 local gefaelle = ScaleAddLinkerVector()
-gefaelle:add(g*height, constOne)
-gefaelle:add(g*zB, constOne)
+gefaelle:add(g*height,downStreamVec)
+gefaelle:add(g*sohle,downStreamVec)
 
 -- Fehlt: h, zB
-elemDisc["v"]:set_upwind(FullUpwind())
+elemDisc["v"]:set_upwind(upwind)
 elemDisc["v"]:set_mass_scale(1.0) 
 elemDisc["v"]:set_diffusion(nu_t)                          -- \partial_x (-nu_t \partial_x v)
-elemDisc["v"]:set_velocity(0.5*elemDisc["v"]:value()*constOne)      -- \partial_x (0.5*v*v)
+elemDisc["v"]:set_velocity(0.5*elemDisc["v"]:value()*downStreamVec)      -- \partial_x (0.5*v*v)
 elemDisc["v"]:set_flux(gefaelle)                           -- \partial_x (g *(h+zB)) 
 elemDisc["v"]:set_reaction_rate(roughness)
 
@@ -146,8 +143,8 @@ dirichletBND:add(10.0, "A", "Source1")
 dirichletBND:add(10.0, "A", "Source2")
 dirichletBND:add(20.0, "A", "Sink")
 
-dirichletBND:add(1.0, "v", "Source1")
-dirichletBND:add(1.0, "v", "Source2")
+dirichletBND:add(0.0, "v", "Source1")
+dirichletBND:add(0.0, "v", "Source2")
 dirichletBND:add(2.0, "v", "Sink")
 
 
@@ -166,10 +163,14 @@ print (">> Setting up Algebra Solver")
 solverDesc = 
 {
   type = "newton",
+  
+  
+
   linSolver = {
-	 type = "linear",
+	 type = "superlu",
 	 
-	 precond = {
+	 -- precond = "ilu",
+	--[[ precond = {
 		type 		= "gmg",	-- preconditioner ["gmg", "ilu", "ilut", "jac", "gs", "sgs"]
 		approxSpace = approxSpace,
 		smoother 	= {
@@ -180,7 +181,7 @@ solverDesc =
 		preSmooth	= 2,		-- number presmoothing steps
 		postSmooth 	= 2,		-- number postsmoothing steps
 		baseSolver 	= "lu"
-	},
+	},--]]
 	
 	convCheck = {
 		type		= "standard",
@@ -189,6 +190,7 @@ solverDesc =
 		reduction	= 1e-12,
 		verbose=true
 	}
+	
 }
 }
 
